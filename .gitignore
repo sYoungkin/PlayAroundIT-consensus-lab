@@ -1,0 +1,6 @@
+.git
+.vagrant/
+*.log
+.DS_Store
+.env
+*.retry

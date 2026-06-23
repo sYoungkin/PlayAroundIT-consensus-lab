@@ -307,3 +307,239 @@ These metrics directly correspond to concepts introduced in the Raft documentati
 - Time-series metrics complement the journal logs by showing how cluster state evolves over time.
 - Prometheus forms the observability foundation for the remainder of the Consensus Lab.
 - The next phase of the project is to explore, classify, and understand the available etcd metrics before building Grafana dashboards.
+
+---
+
+# Troubleshooting
+
+This section documents issues encountered during the implementation of the Prometheus observability stack and the corresponding resolutions.
+
+---
+
+## Issue: Stale Scrape Times
+
+### Symptoms
+
+The Prometheus **Targets** page reported:
+
+- All targets **UP**
+- Last scrape approximately **45 minutes ago**
+- Imported Grafana dashboards showed no recent data.
+
+Example:
+
+```text
+Target: 192.168.135.135:2379
+
+State:
+UP
+
+Last Scrape:
+43 minutes ago
+```
+
+Although the configured scrape interval was:
+
+```yaml
+scrape_interval: 5s
+```
+
+Prometheus was clearly no longer ingesting new samples.
+
+---
+
+## Issue: Sample Ingestion Errors
+
+The Prometheus journal reported warnings similar to:
+
+```text
+Error on ingesting samples that are too old or are too far into the future
+```
+
+and later
+
+```text
+Error on ingesting out-of-order samples
+```
+
+for every etcd scrape target.
+
+Example:
+
+```text
+Error on ingesting out-of-order samples
+
+component="scrape manager"
+
+scrape_pool=etcd
+
+target=http://192.168.135.135:2379/metrics
+```
+
+---
+
+## Initial Investigation
+
+The following checks were performed.
+
+### Verify Prometheus Service
+
+```bash
+sudo systemctl status prometheus
+```
+
+Result:
+
+- Service running normally.
+
+---
+
+### Verify Prometheus Logs
+
+```bash
+sudo journalctl -u prometheus -f
+```
+
+Result:
+
+- Continuous warnings regarding out-of-order samples.
+
+---
+
+### Verify NTP Synchronization
+
+Each virtual machine was checked.
+
+```bash
+timedatectl
+```
+
+Result:
+
+- System clock synchronized: **yes**
+- NTP active on all nodes.
+
+---
+
+### Verify Target Health
+
+Prometheus successfully reached every etcd node.
+
+All scrape targets remained:
+
+```text
+UP
+```
+
+Therefore the problem was **not** network connectivity.
+
+---
+
+## Root Cause
+
+The issue was determined to be related to the local Prometheus time-series database (TSDB).
+
+Although the scrape targets were healthy, Prometheus rejected incoming samples because their timestamps conflicted with previously stored samples.
+
+Possible contributing factors include:
+
+- virtual machine clock adjustments
+- host sleep/resume
+- NTP clock corrections
+- existing TSDB data containing future or out-of-order timestamps
+
+As a result, Prometheus refused to ingest new samples.
+
+---
+
+## Resolution
+
+Stop Prometheus.
+
+```bash
+sudo systemctl stop prometheus
+```
+
+Remove the existing TSDB.
+
+```bash
+sudo rm -rf /var/lib/prometheus/*
+```
+
+Restart Prometheus.
+
+```bash
+sudo systemctl start prometheus
+```
+
+---
+
+## Verification
+
+Confirm that targets are scraped every few seconds.
+
+Expected:
+
+```text
+Last Scrape
+
+2s ago
+5s ago
+```
+
+rather than
+
+```text
+43m ago
+```
+
+Verify that:
+
+- no new ingestion warnings appear in the journal
+- Grafana dashboards receive current data
+- Prometheus queries return recent timestamps
+
+---
+
+## Time Zone Configuration
+
+Although Linux internally keeps time in UTC, configuring every virtual machine to use the local time zone simplifies troubleshooting.
+
+Recommended configuration:
+
+```bash
+sudo timedatectl set-timezone Europe/Berlin
+```
+
+Verify:
+
+```bash
+timedatectl
+```
+
+Expected:
+
+```text
+Local time:
+Europe/Berlin
+
+Universal time:
+UTC
+
+System clock synchronized:
+yes
+```
+
+Changing the time zone affects only the displayed local time and does **not** alter the underlying system clock.
+
+---
+
+## Lessons Learned
+
+- Healthy scrape targets do not necessarily imply successful metric ingestion.
+- Prometheus may reject samples that are older than previously ingested samples or appear to be from the future.
+- The Prometheus journal is the primary source for diagnosing ingestion problems.
+- In a virtualized lab environment, host suspend/resume or clock corrections can result in timestamp inconsistencies.
+- During development, clearing the TSDB is an acceptable recovery procedure when timestamp ordering becomes invalid.
+- Maintaining synchronized clocks across all systems is essential for reliable observability.
+- Using a consistent local time zone across the host and all virtual machines simplifies log correlation and troubleshooting.

@@ -169,12 +169,21 @@ global:
 
 scrape_configs:
   - job_name: "etcd"
-
     static_configs:
       - targets:
           - "192.168.135.135:2379"
+        labels:
+          node: "etcd1"
+
+      - targets:
           - "192.168.135.136:2379"
+        labels:
+          node: "etcd2"
+
+      - targets:
           - "192.168.135.137:2379"
+        labels:
+          node: "etcd3"
 ```
 
 ## Configuration Explanation
@@ -543,3 +552,192 @@ Changing the time zone affects only the displayed local time and does **not** al
 - During development, clearing the TSDB is an acceptable recovery procedure when timestamp ordering becomes invalid.
 - Maintaining synchronized clocks across all systems is essential for reliable observability.
 - Using a consistent local time zone across the host and all virtual machines simplifies log correlation and troubleshooting.
+
+---
+
+## Persistent Startup Time Synchronization
+
+### Problem
+
+After shutting down and restarting the virtual machines, Prometheus repeatedly stopped ingesting new metrics.
+
+Typical symptoms included:
+
+- Prometheus targets remained **UP**
+- Last scrape remained approximately **40–45 minutes** in the past
+- Grafana dashboards stopped updating
+- Prometheus reported repeated ingestion warnings such as:
+
+```text
+Error on ingesting samples that are too old or are too far into the future
+
+Error on ingesting out-of-order samples
+```
+
+Clearing the TSDB restored normal operation, but the problem reappeared after the next reboot.
+
+---
+
+### Working Hypothesis
+
+The current hypothesis is that Prometheus starts before the virtual machine clock has fully synchronized via NTP/Chrony.
+
+The suspected sequence is:
+
+```text
+VM boots
+      │
+      ▼
+Prometheus starts
+      │
+      ▼
+Initial samples written using an incorrect system clock
+      │
+      ▼
+Clock synchronizes via NTP/Chrony
+      │
+      ▼
+New samples appear older or out-of-order
+      │
+      ▼
+Prometheus rejects incoming samples
+```
+
+Although the virtual machines eventually report synchronized clocks, the initial startup sequence may already have introduced invalid timestamps into the TSDB.
+
+This hypothesis has not yet been fully verified but is consistent with the observed behavior.
+
+---
+
+### Proposed Solution
+
+Configure Prometheus to wait until the system clock has synchronized before starting.
+
+---
+
+### Install Chrony
+
+```bash
+sudo apt-get update
+sudo apt-get install -y chrony
+
+sudo systemctl enable --now chrony
+```
+
+---
+
+### Create a Startup Synchronization Script
+
+Create:
+
+```text
+/usr/local/bin/wait-for-time-sync.sh
+```
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+for i in {1..60}; do
+    if chronyc tracking >/dev/null 2>&1 && \
+       chronyc sources | grep -q '^\^\*'; then
+        exit 0
+    fi
+
+    sleep 2
+done
+
+echo "Time synchronization not confirmed."
+exit 1
+```
+
+Make the script executable.
+
+```bash
+sudo chmod +x /usr/local/bin/wait-for-time-sync.sh
+```
+
+---
+
+### Add a systemd Override
+
+Create a systemd override for Prometheus.
+
+```bash
+sudo systemctl edit prometheus
+```
+
+Add:
+
+```ini
+[Unit]
+After=network-online.target chrony.service time-sync.target
+Wants=network-online.target chrony.service time-sync.target
+
+[Service]
+ExecStartPre=/usr/local/bin/wait-for-time-sync.sh
+```
+
+Reload systemd.
+
+```bash
+sudo systemctl daemon-reload
+```
+
+Restart Prometheus.
+
+```bash
+sudo systemctl restart prometheus
+```
+
+---
+
+### One-Time Recovery
+
+If timestamp inconsistencies already exist within the local TSDB, clear the database before restarting Prometheus.
+
+```bash
+sudo systemctl stop prometheus
+
+sudo rm -rf /var/lib/prometheus/*
+
+sudo systemctl start prometheus
+```
+
+Because this lab environment is used for experimentation rather than production monitoring, removing the local TSDB is acceptable.
+
+---
+
+### Verification
+
+After restarting:
+
+- Prometheus targets should be scraped every few seconds.
+- No "out-of-order samples" warnings should appear.
+- No "samples too old" warnings should appear.
+- Grafana dashboards should update continuously.
+
+Verify:
+
+```bash
+sudo journalctl -u prometheus -f
+```
+
+Expected:
+
+No further timestamp-related ingestion warnings.
+
+---
+
+### Future Investigation
+
+This solution represents the current best hypothesis based on observed behavior.
+
+Future experiments should determine:
+
+- Whether the issue is reproducible after every VM reboot.
+- Whether waiting for time synchronization completely eliminates the problem.
+- Whether VMware Fusion guest time synchronization contributes to the issue.
+- Whether the problem is specific to Prometheus 3.x or also occurs with earlier releases.
+
+Documenting both the hypothesis and the validation results will improve the operational understanding of the observability stack over time.
